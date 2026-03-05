@@ -1,0 +1,7 @@
+motor
+python-dotenv
+fastapi
+uvicorn
+pydantic
+dotenv
+slowapi
