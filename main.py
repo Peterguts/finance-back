@@ -33,6 +33,12 @@ client: Optional[AsyncIOMotorClient] = None
 db = None
 coll = None  # finanzas.transactions
 
+# Alias de ticker -> símbolo real (p. ej. Yahoo/Finnhub usan ADBE para Adobe)
+TICKER_ALIASES: dict[str, str] = {
+    "ADOBE": "ADBE",
+}
+
+# Precios de respaldo cuando yfinance/Finnhub fallan (ej. en servidor sin FINNHUB_API_KEY)
 MOCK_PRICES: dict[str, float] = {
     "BTC": 67500.00,
     "ETH": 3450.00,
@@ -42,6 +48,14 @@ MOCK_PRICES: dict[str, float] = {
     "TSLA": 245.60,
     "AMZN": 178.90,
     "NVDA": 875.30,
+    "META": 485.00,
+    "NFLX": 615.00,
+    "DIS": 115.00,
+    "JPM": 195.00,
+    "V": 270.00,
+    "JNJ": 155.00,
+    "PYPL": 65.00,
+    "COIN": 245.00,
 }
 
 
@@ -80,6 +94,7 @@ async def fetch_finnhub_price(ticker: str) -> float:
 
 async def get_current_price(ticker: str) -> float:
     symbol = ticker.upper()
+    symbol = TICKER_ALIASES.get(symbol, symbol)
     p = await asyncio.to_thread(_yfinance_price_sync, symbol)
     if p > 0:
         return p
@@ -263,12 +278,24 @@ async def get_portfolio_summary():
     )
 
 
-@app.get("/prices/{ticker}")
-async def get_price(ticker: str):
-    price = await get_current_price(ticker.upper())
-    if price == 0:
-        raise HTTPException(status_code=404, detail=f"Price not found for {ticker}")
-    return {"ticker": ticker.upper(), "price": price}
+# Rutas más específicas primero: /prices/status y /prices antes que /prices/{ticker}
+# (si no, GET /prices/status coincidiría con ticker="status" y devolvería 404)
+
+
+@app.get("/prices/status")
+async def get_prices_status():
+    """Check if we can get live market prices (yfinance or Finnhub)."""
+    try:
+        p = await asyncio.to_thread(_yfinance_price_sync, "AAPL")
+        if p > 0:
+            return {"live": True}
+        if FINNHUB_API_KEY:
+            p = await fetch_finnhub_price("AAPL")
+            if p > 0:
+                return {"live": True}
+    except Exception:
+        pass
+    return {"live": False}
 
 
 @app.get("/prices")
@@ -286,17 +313,9 @@ async def get_all_prices():
     return result if result else MOCK_PRICES
 
 
-@app.get("/prices/status")
-async def get_prices_status():
-    """Check if we can get live market prices (yfinance or Finnhub)."""
-    try:
-        p = await asyncio.to_thread(_yfinance_price_sync, "AAPL")
-        if p > 0:
-            return {"live": True}
-        if FINNHUB_API_KEY:
-            p = await fetch_finnhub_price("AAPL")
-            if p > 0:
-                return {"live": True}
-    except Exception:
-        pass
-    return {"live": False}
+@app.get("/prices/{ticker}")
+async def get_price(ticker: str):
+    price = await get_current_price(ticker.upper())
+    if price == 0:
+        raise HTTPException(status_code=404, detail=f"Price not found for {ticker}")
+    return {"ticker": ticker.upper(), "price": price}
