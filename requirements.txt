@@ -1,7 +1,6 @@
-motor
-python-dotenv
-fastapi
-uvicorn
-pydantic
-dotenv
-slowapi
+fastapi>=0.115.0
+python-dotenv>=1.0.0
+httpx>=0.27.0
+motor>=3.3.0
+pydantic>=2.0.0
+yfinance>=0.2.0
