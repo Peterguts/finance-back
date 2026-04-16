@@ -253,6 +253,39 @@ class Deposit(BaseModel):
     updated_at: str
 
 
+class SimulatorAsset(BaseModel):
+    ticker: str
+    quantity: float
+    avg_buy_price: float
+    cost_basis: float
+    current_price: float
+    current_value: float
+    unrealized_pnl: float
+
+
+class SimulatorHistoryPoint(BaseModel):
+    date: str
+    close: float
+
+
+class SimulatorScenarioRequest(BaseModel):
+    ticker: str = Field(..., min_length=1, max_length=20)
+    change_pct: float = Field(..., ge=-50, le=50)
+
+
+class SimulatorScenarioResult(BaseModel):
+    ticker: str
+    change_pct: float
+    quantity: float
+    cost_basis: float
+    current_price: float
+    projected_price: float
+    current_value: float
+    projected_value: float
+    pnl: float
+    roi_pct: float
+
+
 def _doc_to_investment(doc: dict) -> Investment:
     """Map finanzas.transactions document to API Investment model."""
     doc_id = doc.get("id") or doc.get("_id")
@@ -349,6 +382,26 @@ async def _get_available_quantity(ticker: str) -> float:
         return 0
     bought, sold, _ = pos[t]
     return max(0, bought - sold)
+
+
+async def _get_simulator_assets_data() -> dict[str, tuple[float, float, float, float, float]]:
+    """
+    Returns per ticker:
+    (current_qty, avg_buy_price, cost_basis, current_price, current_value)
+    """
+    pos_data = await _get_position_and_cost_per_ticker()
+    out: dict[str, tuple[float, float, float, float, float]] = {}
+    for ticker, (bought, sold, avg_buy) in pos_data.items():
+        current_qty = max(0, bought - sold)
+        if current_qty <= 0:
+            continue
+        cost_basis = round(current_qty * avg_buy, 6)
+        current_price = await get_current_price(ticker)
+        if current_price <= 0:
+            current_price = avg_buy
+        current_value = round(current_qty * current_price, 6)
+        out[ticker] = (current_qty, avg_buy, cost_basis, current_price, current_value)
+    return out
 
 
 @app.get("/health")
@@ -759,6 +812,90 @@ async def get_usd_gtq_rate():
         "source": source,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.get("/simulator/assets", response_model=list[SimulatorAsset])
+async def list_simulator_assets():
+    if coll is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    assets = await _get_simulator_assets_data()
+    result: list[SimulatorAsset] = []
+    for ticker, (qty, avg_buy, cost_basis, current_price, current_value) in assets.items():
+        result.append(
+            SimulatorAsset(
+                ticker=ticker,
+                quantity=round(qty, 8),
+                avg_buy_price=round(avg_buy, 8),
+                cost_basis=round(cost_basis, 6),
+                current_price=round(current_price, 6),
+                current_value=round(current_value, 6),
+                unrealized_pnl=round(current_value - cost_basis, 6),
+            )
+        )
+    return sorted(result, key=lambda a: a.current_value, reverse=True)
+
+
+@app.get("/simulator/history/{ticker}", response_model=list[SimulatorHistoryPoint])
+async def get_simulator_history(
+    ticker: str,
+    period: str = Query("3mo"),
+    interval: str = Query("1d"),
+    limit: int = Query(120, ge=10, le=500),
+):
+    symbol = normalize_ticker(ticker)
+    symbol = TICKER_ALIASES.get(symbol, symbol)
+    try:
+        df = await asyncio.to_thread(lambda: yf.Ticker(symbol).history(period=period, interval=interval))
+        points: list[SimulatorHistoryPoint] = []
+        if df is not None and not df.empty and "Close" in df.columns:
+            for idx, row in df.tail(limit).iterrows():
+                date_str = idx.strftime("%Y-%m-%d") if hasattr(idx, "strftime") else str(idx)[:10]
+                close = float(row.get("Close", 0))
+                if close > 0:
+                    points.append(SimulatorHistoryPoint(date=date_str, close=round(close, 6)))
+        if points:
+            return points
+    except Exception:
+        pass
+    # fallback simple synthetic history around current price
+    p = await get_current_price(symbol)
+    if p <= 0:
+        p = 1.0
+    out = []
+    base = p * 0.97
+    for i in range(30):
+        d = datetime.now(timezone.utc).date()
+        day = (d.fromordinal(d.toordinal() - (29 - i))).isoformat()
+        val = round(base + (p - base) * (i / 29), 6)
+        out.append(SimulatorHistoryPoint(date=day, close=val))
+    return out
+
+
+@app.post("/simulator/scenario", response_model=SimulatorScenarioResult)
+async def simulate_scenario(body: SimulatorScenarioRequest):
+    if coll is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    t = normalize_ticker(body.ticker)
+    assets = await _get_simulator_assets_data()
+    if t not in assets:
+        raise HTTPException(status_code=404, detail=f"No active position for {t}")
+    qty, avg_buy, cost_basis, current_price, current_value = assets[t]
+    projected_price = current_price * (1 + body.change_pct / 100.0)
+    projected_value = qty * projected_price
+    pnl = projected_value - cost_basis
+    roi_pct = (pnl / cost_basis * 100) if cost_basis > 0 else 0.0
+    return SimulatorScenarioResult(
+        ticker=t,
+        change_pct=round(body.change_pct, 4),
+        quantity=round(qty, 8),
+        cost_basis=round(cost_basis, 6),
+        current_price=round(current_price, 6),
+        projected_price=round(projected_price, 6),
+        current_value=round(current_value, 6),
+        projected_value=round(projected_value, 6),
+        pnl=round(pnl, 6),
+        roi_pct=round(roi_pct, 4),
+    )
 
 
 def _deposit_amounts(amount: float, commission_pct: float) -> tuple[float, float]:
