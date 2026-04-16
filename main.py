@@ -29,10 +29,12 @@ app.add_middleware(
 
 MONGO_URI = os.environ.get("MONGO_URI")
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
+USD_TO_GTQ_FALLBACK = float(os.environ.get("USD_TO_GTQ_FALLBACK", "7.75"))
 client: Optional[AsyncIOMotorClient] = None
 db = None
 coll = None  # finanzas.transactions
 sales_coll = None  # finanzas.sales
+deposits_coll = None  # finanzas.deposits
 
 MOCK_PRICES: dict[str, float] = {
     "BTC": 67500.00,
@@ -49,6 +51,22 @@ TICKER_ALIASES: dict[str, str] = {
     "ADOBE": "ADBE",
     "LINKUSD": "LINK-USD",
 }
+
+
+def normalize_ticker(ticker: str) -> str:
+    """Un solo símbolo canónico por activo (evita duplicar LINKUSD y LINK-USD)."""
+    t = (ticker or "").strip().upper()
+    if t in ("LINKUSD", "LINK-USD"):
+        return "LINK-USD"
+    return t
+
+
+def ticker_raw_variants(ticker: str) -> list[str]:
+    """Valores que pueden existir en Mongo para el mismo activo (filtros)."""
+    t = normalize_ticker(ticker)
+    if t == "LINK-USD":
+        return ["LINK-USD", "LINKUSD"]
+    return [t]
 
 
 def _yfinance_price_sync(symbol: str) -> float:
@@ -84,8 +102,25 @@ async def fetch_finnhub_price(ticker: str) -> float:
         return 0.0
 
 
+async def fetch_usd_to_gtq_rate() -> tuple[float, bool, str]:
+    """Fetch USD->GTQ rate from public API; fallback to env/default."""
+    url = "https://open.er-api.com/v6/latest/USD"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client_http:
+            r = await client_http.get(url)
+            if r.status_code == 200:
+                data = r.json()
+                rates = data.get("rates") or {}
+                gtq = rates.get("GTQ")
+                if gtq is not None:
+                    return float(gtq), True, "open.er-api.com"
+    except Exception:
+        pass
+    return USD_TO_GTQ_FALLBACK, False, "fallback"
+
+
 async def get_current_price(ticker: str) -> float:
-    symbol = ticker.upper()
+    symbol = normalize_ticker(ticker)
     symbol = TICKER_ALIASES.get(symbol, symbol)
     p = await asyncio.to_thread(_yfinance_price_sync, symbol)
     if p > 0:
@@ -99,16 +134,19 @@ async def get_current_price(ticker: str) -> float:
 
 @app.on_event("startup")
 async def startup_db_client():
-    global client, db, coll, sales_coll
+    global client, db, coll, sales_coll, deposits_coll
     if MONGO_URI:
         client = AsyncIOMotorClient(MONGO_URI)
         db = client.finanzas
         coll = db.transactions
         sales_coll = db.sales
+        deposits_coll = db.deposits
         await coll.create_index("ticker")
         await sales_coll.create_index("ticker")
         await sales_coll.create_index("date")
         await sales_coll.create_index("created_at")
+        await deposits_coll.create_index("date")
+        await deposits_coll.create_index("created_at")
 
 
 @app.on_event("shutdown")
@@ -183,8 +221,36 @@ class PortfolioSummary(BaseModel):
     pnl_percentage: float
     total_realized_pnl: float
     total_unrealized_pnl: float
+    total_deposited: float
+    total_spent_on_buys: float
+    total_received_from_sales: float
+    estimated_cash: float
+    estimated_net_worth: float
     investments: list[Investment]
     positions: list[PortfolioPosition]
+
+
+class DepositCreate(BaseModel):
+    date: str = Field(..., min_length=10, max_length=10)
+    amount: float = Field(..., gt=0)
+    commission_pct: float = Field(..., ge=0, le=100)
+
+
+class DepositUpdate(BaseModel):
+    date: Optional[str] = Field(None, min_length=10, max_length=10)
+    amount: Optional[float] = Field(None, gt=0)
+    commission_pct: Optional[float] = Field(None, ge=0, le=100)
+
+
+class Deposit(BaseModel):
+    id: str
+    date: str
+    amount: float
+    commission_pct: float
+    commission_amount: float
+    total: float
+    created_at: str
+    updated_at: str
 
 
 def _doc_to_investment(doc: dict) -> Investment:
@@ -194,7 +260,7 @@ def _doc_to_investment(doc: dict) -> Investment:
         doc_id = ""
     return Investment(
         id=str(doc_id),
-        ticker=doc.get("ticker", ""),
+        ticker=normalize_ticker(doc.get("ticker", "")),
         amount=float(doc.get("quantity", 0)),
         buy_price=float(doc.get("buy_price", 0)),
         timestamp=doc.get("created_at") or doc.get("date") or "",
@@ -206,7 +272,7 @@ def _doc_to_sale(doc: dict) -> Sale:
     doc_id = doc.get("id") or doc.get("_id", "")
     return Sale(
         id=str(doc_id),
-        ticker=doc.get("ticker", ""),
+        ticker=normalize_ticker(doc.get("ticker", "")),
         quantity=float(doc.get("quantity", 0)),
         sell_price=float(doc.get("sell_price", 0)),
         date=doc.get("date", ""),
@@ -216,11 +282,30 @@ def _doc_to_sale(doc: dict) -> Sale:
     )
 
 
+def _parse_doc_datetime(doc: dict) -> Optional[datetime]:
+    """Parse created_at/date from mongo docs as timezone-aware datetime."""
+    raw = doc.get("created_at") or doc.get("date")
+    if not raw:
+        return None
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo is not None else raw.replace(tzinfo=timezone.utc)
+    try:
+        s = str(raw)
+        if len(s) == 10 and s.count("-") == 2:
+            s = f"{s}T00:00:00+00:00"
+        s = s.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
 async def _get_position_and_cost_per_ticker() -> dict[str, tuple[float, float, float]]:
     """Returns per ticker: (total_bought_qty, total_sold_qty, avg_buy_price)."""
     ticker_bought: dict[str, list[tuple[float, float]]] = {}  # ticker -> [(qty, price), ...]
+    ticker_first_buy_dt: dict[str, datetime] = {}
     async for doc in coll.find():
-        t = (doc.get("ticker") or "").upper()
+        t = normalize_ticker(doc.get("ticker") or "")
         if not t:
             continue
         q = float(doc.get("quantity", 0))
@@ -228,12 +313,24 @@ async def _get_position_and_cost_per_ticker() -> dict[str, tuple[float, float, f
         if t not in ticker_bought:
             ticker_bought[t] = []
         ticker_bought[t].append((q, p))
+        dt = _parse_doc_datetime(doc)
+        if dt is not None:
+            prev = ticker_first_buy_dt.get(t)
+            if prev is None or dt < prev:
+                ticker_first_buy_dt[t] = dt
     ticker_sold: dict[str, float] = {}
     if sales_coll is not None:
         async for doc in sales_coll.find():
-            t = (doc.get("ticker") or "").upper()
+            t = normalize_ticker(doc.get("ticker") or "")
             if not t:
                 continue
+            first_buy = ticker_first_buy_dt.get(t)
+            if first_buy is not None:
+                sale_dt = _parse_doc_datetime(doc)
+                # Preserve historical sales records without descontar posiciones
+                # when they happened before the current portfolio baseline.
+                if sale_dt is not None and sale_dt < first_buy:
+                    continue
             ticker_sold[t] = ticker_sold.get(t, 0) + float(doc.get("quantity", 0))
     result: dict[str, tuple[float, float, float]] = {}
     for t, buys in ticker_bought.items():
@@ -247,7 +344,7 @@ async def _get_position_and_cost_per_ticker() -> dict[str, tuple[float, float, f
 
 async def _get_available_quantity(ticker: str) -> float:
     pos = await _get_position_and_cost_per_ticker()
-    t = ticker.upper()
+    t = normalize_ticker(ticker)
     if t not in pos:
         return 0
     bought, sold, _ = pos[t]
@@ -270,7 +367,7 @@ async def create_investment(investment: InvestmentCreate):
     doc = {
         "_id": doc_id,
         "id": doc_id,
-        "ticker": investment.ticker.upper(),
+        "ticker": normalize_ticker(investment.ticker),
         "quantity": investment.amount,
         "buy_price": investment.buy_price,
         "date": date_str,
@@ -284,11 +381,15 @@ async def create_investment(investment: InvestmentCreate):
 
 
 @app.get("/investments", response_model=list[Investment])
-async def get_investments():
+async def get_investments(ticker: Optional[str] = Query(None)):
     if coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
+    q = {}
+    if ticker and ticker.strip():
+        q["ticker"] = {"$in": ticker_raw_variants(ticker.strip())}
     investments = []
-    async for doc in coll.find().sort("created_at", -1):
+    cursor = coll.find(q).sort("created_at", -1)
+    async for doc in cursor:
         investments.append(_doc_to_investment(doc))
     return investments
 
@@ -310,7 +411,7 @@ async def update_investment(investment_id: str, update: InvestmentUpdate):
     raw = update.model_dump(exclude_none=True)
     set_data = {}
     if "ticker" in raw:
-        set_data["ticker"] = raw["ticker"].upper()
+        set_data["ticker"] = normalize_ticker(raw["ticker"])
     if "buy_price" in raw:
         set_data["buy_price"] = raw["buy_price"]
     if "amount" in raw:
@@ -347,7 +448,7 @@ async def delete_investment(investment_id: str):
 async def create_sale(sale: SaleCreate):
     if coll is None or sales_coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
-    ticker = sale.ticker.upper()
+    ticker = normalize_ticker(sale.ticker)
     available = await _get_available_quantity(ticker)
     if available < sale.quantity:
         raise HTTPException(
@@ -390,7 +491,7 @@ async def get_sales(
         raise HTTPException(status_code=503, detail="Database not connected")
     query = {}
     if ticker:
-        query["ticker"] = ticker.upper()
+        query["ticker"] = {"$in": ticker_raw_variants(ticker)}
     if from_date or to_date:
         date_q = {}
         if from_date:
@@ -429,7 +530,7 @@ async def get_movements(
     if type_filter is None or type_filter == "buy":
         q = {}
         if ticker:
-            q["ticker"] = ticker.upper()
+            q["ticker"] = {"$in": ticker_raw_variants(ticker)}
         if from_date or to_date:
             date_q = {}
             if from_date:
@@ -445,7 +546,7 @@ async def get_movements(
                 Movement(
                     id=str(tid),
                     type="buy",
-                    ticker=(doc.get("ticker") or "").upper(),
+                    ticker=normalize_ticker(doc.get("ticker") or ""),
                     quantity=qty,
                     price=price,
                     amount=round(qty * price, 2),
@@ -457,7 +558,7 @@ async def get_movements(
     if type_filter is None or type_filter == "sell":
         q = {}
         if ticker:
-            q["ticker"] = ticker.upper()
+            q["ticker"] = {"$in": ticker_raw_variants(ticker)}
         if from_date or to_date:
             date_q = {}
             if from_date:
@@ -473,7 +574,7 @@ async def get_movements(
                 Movement(
                     id=str(sid),
                     type="sell",
-                    ticker=(doc.get("ticker") or "").upper(),
+                    ticker=normalize_ticker(doc.get("ticker") or ""),
                     quantity=qty,
                     price=price,
                     amount=round(qty * price, 2),
@@ -494,13 +595,32 @@ async def get_portfolio_summary():
     async for doc in coll.find().sort("created_at", -1):
         investments.append(_doc_to_investment(doc))
 
+    ticker_first_buy_dt: dict[str, datetime] = {}
+    async for doc in coll.find():
+        t = normalize_ticker(doc.get("ticker") or "")
+        if not t:
+            continue
+        dt = _parse_doc_datetime(doc)
+        if dt is not None:
+            prev = ticker_first_buy_dt.get(t)
+            if prev is None or dt < prev:
+                ticker_first_buy_dt[t] = dt
+
     pos_data = await _get_position_and_cost_per_ticker()
     realized_by_ticker: dict[str, float] = {}
+    total_received_from_sales = 0.0
     if sales_coll is not None:
         async for doc in sales_coll.find():
-            t = (doc.get("ticker") or "").upper()
+            t = normalize_ticker(doc.get("ticker") or "")
             if t:
                 realized_by_ticker[t] = realized_by_ticker.get(t, 0) + float(doc.get("realized_pnl", 0))
+                first_buy = ticker_first_buy_dt.get(t)
+                if first_buy is not None:
+                    sale_dt = _parse_doc_datetime(doc)
+                    if sale_dt is None or sale_dt >= first_buy:
+                        total_received_from_sales += float(doc.get("quantity", 0)) * float(
+                            doc.get("sell_price", 0)
+                        )
 
     total_invested = 0.0
     current_value = 0.0
@@ -546,6 +666,26 @@ async def get_portfolio_summary():
     pnl_percentage = (total_pnl / total_invested * 100) if total_invested > 0 else 0
     total_invested = round(total_invested, 2)
     current_value = round(current_value, 2)
+
+    total_deposited = 0.0
+    if deposits_coll is not None:
+        async for doc in deposits_coll.find():
+            # Capital depositado: la comisión se registra aparte y no suma al capital invertible.
+            total_deposited += float(doc.get("amount", 0))
+
+    total_spent_on_buys = 0.0
+    async for doc in coll.find():
+        total_spent_on_buys += float(doc.get("quantity", 0)) * float(doc.get("buy_price", 0))
+    total_spent_on_buys = round(total_spent_on_buys, 2)
+
+    total_received_from_sales = round(total_received_from_sales, 2)
+
+    total_deposited = round(total_deposited, 2)
+    estimated_cash = round(
+        total_deposited - total_spent_on_buys + total_received_from_sales, 2
+    )
+    estimated_net_worth = round(estimated_cash + current_value, 2)
+
     return PortfolioSummary(
         total_invested=total_invested,
         current_value=current_value,
@@ -553,6 +693,11 @@ async def get_portfolio_summary():
         pnl_percentage=round(pnl_percentage, 2),
         total_realized_pnl=total_realized,
         total_unrealized_pnl=total_unrealized,
+        total_deposited=total_deposited,
+        total_spent_on_buys=total_spent_on_buys,
+        total_received_from_sales=total_received_from_sales,
+        estimated_cash=estimated_cash,
+        estimated_net_worth=estimated_net_worth,
         investments=investments,
         positions=sorted(positions, key=lambda p: (p.quantity == 0, -p.current_value)),
     )
@@ -584,9 +729,11 @@ async def get_all_prices():
         return MOCK_PRICES
     tickers: set[str] = set()
     async for doc in coll.find():
-        tickers.add((doc.get("ticker") or "").upper())
+        tickers.add(normalize_ticker(doc.get("ticker") or ""))
     result: dict[str, float] = {}
     for t in tickers:
+        if not t:
+            continue
         p = await get_current_price(t)
         if p > 0:
             result[t] = p
@@ -595,7 +742,129 @@ async def get_all_prices():
 
 @app.get("/prices/{ticker}")
 async def get_price(ticker: str):
-    price = await get_current_price(ticker.upper())
+    sym = normalize_ticker(ticker)
+    price = await get_current_price(sym)
     if price == 0:
         raise HTTPException(status_code=404, detail=f"Price not found for {ticker}")
-    return {"ticker": ticker.upper(), "price": price}
+    return {"ticker": sym, "price": price}
+
+
+@app.get("/fx/usd-gtq")
+async def get_usd_gtq_rate():
+    rate, live, source = await fetch_usd_to_gtq_rate()
+    return {
+        "pair": "USD/GTQ",
+        "rate": round(rate, 6),
+        "live": live,
+        "source": source,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _deposit_amounts(amount: float, commission_pct: float) -> tuple[float, float]:
+    commission_amount = round(amount * (commission_pct / 100.0), 2)
+    total = round(amount + commission_amount, 2)
+    return commission_amount, total
+
+
+def _doc_to_deposit(doc: dict) -> Deposit:
+    doc_id = doc.get("id") or doc.get("_id", "")
+    return Deposit(
+        id=str(doc_id),
+        date=doc.get("date", ""),
+        amount=float(doc.get("amount", 0)),
+        commission_pct=float(doc.get("commission_pct", 0)),
+        commission_amount=float(doc.get("commission_amount", 0)),
+        total=float(doc.get("total", 0)),
+        created_at=doc.get("created_at", ""),
+        updated_at=doc.get("updated_at", ""),
+    )
+
+
+@app.post("/deposits", response_model=Deposit)
+async def create_deposit(body: DepositCreate):
+    if deposits_coll is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    commission_amount, total = _deposit_amounts(body.amount, body.commission_pct)
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    doc_id = str(uuid.uuid4())
+    doc = {
+        "_id": doc_id,
+        "id": doc_id,
+        "date": body.date,
+        "amount": body.amount,
+        "commission_pct": body.commission_pct,
+        "commission_amount": commission_amount,
+        "total": total,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+    await deposits_coll.insert_one(doc)
+    return _doc_to_deposit(doc)
+
+
+@app.get("/deposits", response_model=list[Deposit])
+async def list_deposits():
+    if deposits_coll is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    out: list[Deposit] = []
+    async for doc in deposits_coll.find().sort("date", -1):
+        out.append(_doc_to_deposit(doc))
+    return out
+
+
+@app.get("/deposits/{deposit_id}", response_model=Deposit)
+async def get_deposit(deposit_id: str):
+    if deposits_coll is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    doc = await deposits_coll.find_one({"$or": [{"_id": deposit_id}, {"id": deposit_id}]})
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Deposit not found")
+    return _doc_to_deposit(doc)
+
+
+@app.put("/deposits/{deposit_id}", response_model=Deposit)
+async def update_deposit(deposit_id: str, update: DepositUpdate):
+    if deposits_coll is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    doc = await deposits_coll.find_one({"$or": [{"_id": deposit_id}, {"id": deposit_id}]})
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Deposit not found")
+    raw = update.model_dump(exclude_none=True)
+    amount = float(doc.get("amount", 0))
+    commission_pct = float(doc.get("commission_pct", 0))
+    date_str = doc.get("date", "")
+    if "amount" in raw:
+        amount = raw["amount"]
+    if "commission_pct" in raw:
+        commission_pct = raw["commission_pct"]
+    if "date" in raw:
+        date_str = raw["date"]
+    commission_amount, total = _deposit_amounts(amount, commission_pct)
+    set_data = {
+        "date": date_str,
+        "amount": amount,
+        "commission_pct": commission_pct,
+        "commission_amount": commission_amount,
+        "total": total,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await deposits_coll.update_one(
+        {"$or": [{"_id": deposit_id}, {"id": deposit_id}]},
+        {"$set": set_data},
+    )
+    doc = await deposits_coll.find_one({"$or": [{"_id": deposit_id}, {"id": deposit_id}]})
+    return _doc_to_deposit(doc)
+
+
+@app.delete("/deposits/{deposit_id}")
+async def delete_deposit(deposit_id: str):
+    if deposits_coll is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    result = await deposits_coll.delete_one(
+        {"$or": [{"_id": deposit_id}, {"id": deposit_id}]}
+    )
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Deposit not found")
+    return {"message": "Deposit deleted successfully"}
