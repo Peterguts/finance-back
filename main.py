@@ -35,6 +35,7 @@ db = None
 coll = None  # finanzas.transactions
 sales_coll = None  # finanzas.sales
 deposits_coll = None  # finanzas.deposits
+settings_coll = None  # finanzas.settings (ajustes de efectivo, etc.)
 
 MOCK_PRICES: dict[str, float] = {
     "BTC": 67500.00,
@@ -56,7 +57,7 @@ TICKER_ALIASES: dict[str, str] = {
 def normalize_ticker(ticker: str) -> str:
     """Un solo símbolo canónico por activo (evita duplicar LINKUSD y LINK-USD)."""
     t = (ticker or "").strip().upper()
-    if t in ("LINKUSD", "LINK-USD"):
+    if t in ("LINKUSD", "LINK-USD", "LINK"):
         return "LINK-USD"
     return t
 
@@ -65,7 +66,7 @@ def ticker_raw_variants(ticker: str) -> list[str]:
     """Valores que pueden existir en Mongo para el mismo activo (filtros)."""
     t = normalize_ticker(ticker)
     if t == "LINK-USD":
-        return ["LINK-USD", "LINKUSD"]
+        return ["LINK-USD", "LINKUSD", "LINK"]
     return [t]
 
 
@@ -134,13 +135,14 @@ async def get_current_price(ticker: str) -> float:
 
 @app.on_event("startup")
 async def startup_db_client():
-    global client, db, coll, sales_coll, deposits_coll
+    global client, db, coll, sales_coll, deposits_coll, settings_coll
     if MONGO_URI:
         client = AsyncIOMotorClient(MONGO_URI)
         db = client.finanzas
         coll = db.transactions
         sales_coll = db.sales
         deposits_coll = db.deposits
+        settings_coll = db.settings
         await coll.create_index("ticker")
         await sales_coll.create_index("ticker")
         await sales_coll.create_index("date")
@@ -193,6 +195,11 @@ class Sale(BaseModel):
     created_at: str
 
 
+class SaleUpdate(BaseModel):
+    quantity: Optional[float] = Field(None, gt=0)
+    sell_price: Optional[float] = Field(None, gt=0)
+
+
 class PortfolioPosition(BaseModel):
     ticker: str
     quantity: float
@@ -200,6 +207,8 @@ class PortfolioPosition(BaseModel):
     current_value: float
     unrealized_pnl: float
     realized_pnl: float
+    total_bought_quantity: float = 0.0
+    total_sold_quantity: float = 0.0
 
 
 class Movement(BaseModel):
@@ -225,6 +234,8 @@ class PortfolioSummary(BaseModel):
     total_spent_on_buys: float
     total_received_from_sales: float
     estimated_cash: float
+    estimated_cash_before_adjustment: float
+    cash_adjustment_usd: float
     estimated_net_worth: float
     investments: list[Investment]
     positions: list[PortfolioPosition]
@@ -382,6 +393,27 @@ async def _get_available_quantity(ticker: str) -> float:
         return 0
     bought, sold, _ = pos[t]
     return max(0, bought - sold)
+
+
+async def _max_sale_quantity_allowed(ticker: str, current_sale_qty: float) -> float:
+    """Máxima cantidad que puede tener esta fila de venta sin vender más de lo comprado."""
+    t = normalize_ticker(ticker)
+    pos_data = await _get_position_and_cost_per_ticker()
+    if t not in pos_data:
+        return 0.0
+    bought, total_sold, _ = pos_data[t]
+    net = bought - total_sold
+    return current_sale_qty + net
+
+
+async def _cash_adjustment_usd() -> float:
+    """Ajuste manual al efectivo estimado (comisiones, diferencias con el broker). Ver `settings` portfolio."""
+    if settings_coll is None:
+        return 0.0
+    doc = await settings_coll.find_one({"$or": [{"_id": "portfolio"}, {"id": "portfolio"}]})
+    if not doc:
+        return 0.0
+    return float(doc.get("cash_adjustment_usd", 0))
 
 
 async def _get_simulator_assets_data() -> dict[str, tuple[float, float, float, float, float]]:
@@ -568,6 +600,57 @@ async def get_sale(sale_id: str):
     return _doc_to_sale(doc)
 
 
+@app.patch("/sales/{sale_id}", response_model=Sale)
+async def update_sale(sale_id: str, update: SaleUpdate):
+    if sales_coll is None or coll is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    raw = update.model_dump(exclude_none=True)
+    if not raw:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    doc = await sales_coll.find_one({"$or": [{"_id": sale_id}, {"id": sale_id}]})
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Sale not found")
+    ticker = normalize_ticker(doc.get("ticker") or "")
+    old_qty = float(doc.get("quantity", 0))
+    old_price = float(doc.get("sell_price", 0))
+    new_qty = float(raw["quantity"]) if "quantity" in raw else old_qty
+    new_price = float(raw["sell_price"]) if "sell_price" in raw else old_price
+    max_q = await _max_sale_quantity_allowed(ticker, old_qty)
+    if new_qty > max_q + 1e-9:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cantidad máxima permitida para esta venta: {max_q:.8f}",
+        )
+    pos_data = await _get_position_and_cost_per_ticker()
+    if ticker not in pos_data:
+        raise HTTPException(status_code=400, detail="Ticker sin compras registradas")
+    _, _, avg_buy = pos_data[ticker]
+    realized_pnl = new_qty * (new_price - avg_buy)
+    set_data = {
+        "quantity": new_qty,
+        "sell_price": new_price,
+        "cost_basis": round(avg_buy, 4),
+        "realized_pnl": round(realized_pnl, 2),
+        "realized_pnl_from_broker": False,
+    }
+    await sales_coll.update_one(
+        {"$or": [{"_id": sale_id}, {"id": sale_id}]},
+        {"$set": set_data},
+    )
+    updated = await sales_coll.find_one({"$or": [{"_id": sale_id}, {"id": sale_id}]})
+    return _doc_to_sale(updated)
+
+
+@app.delete("/sales/{sale_id}")
+async def delete_sale(sale_id: str):
+    if sales_coll is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    result = await sales_coll.delete_one({"$or": [{"_id": sale_id}, {"id": sale_id}]})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Sale not found")
+    return {"message": "Sale deleted"}
+
+
 @app.get("/movements", response_model=list[Movement])
 async def get_movements(
     ticker: Optional[str] = Query(None),
@@ -681,17 +764,20 @@ async def get_portfolio_summary():
     for ticker, (bought, sold, avg_buy) in pos_data.items():
         current_qty = max(0, bought - sold)
         if current_qty <= 0:
-            if ticker in realized_by_ticker and realized_by_ticker[ticker] != 0:
-                positions.append(
-                    PortfolioPosition(
-                        ticker=ticker,
-                        quantity=0,
-                        cost_basis=0,
-                        current_value=0,
-                        unrealized_pnl=0,
-                        realized_pnl=round(realized_by_ticker[ticker], 2),
-                    )
+            # Siempre incluir el ticker si hubo compras: evita "fantasmas" en la UI cuando
+            # la posición neta es 0 pero hay compras registradas o ventas sin P/L calculado.
+            positions.append(
+                PortfolioPosition(
+                    ticker=ticker,
+                    quantity=0,
+                    cost_basis=0,
+                    current_value=0,
+                    unrealized_pnl=0,
+                    realized_pnl=round(realized_by_ticker.get(ticker, 0), 2),
+                    total_bought_quantity=round(bought, 8),
+                    total_sold_quantity=round(sold, 8),
                 )
+            )
             continue
         cost_basis = round(current_qty * avg_buy, 2)
         total_invested += cost_basis
@@ -710,6 +796,8 @@ async def get_portfolio_summary():
                 current_value=curr_val,
                 unrealized_pnl=unrealized,
                 realized_pnl=realized,
+                total_bought_quantity=round(bought, 8),
+                total_sold_quantity=round(sold, 8),
             )
         )
     total_realized = sum(realized_by_ticker.values())
@@ -734,9 +822,11 @@ async def get_portfolio_summary():
     total_received_from_sales = round(total_received_from_sales, 2)
 
     total_deposited = round(total_deposited, 2)
-    estimated_cash = round(
+    estimated_cash_before_adjustment = round(
         total_deposited - total_spent_on_buys + total_received_from_sales, 2
     )
+    cash_adjustment_usd = round(await _cash_adjustment_usd(), 2)
+    estimated_cash = round(estimated_cash_before_adjustment + cash_adjustment_usd, 2)
     estimated_net_worth = round(estimated_cash + current_value, 2)
 
     return PortfolioSummary(
@@ -750,6 +840,8 @@ async def get_portfolio_summary():
         total_spent_on_buys=total_spent_on_buys,
         total_received_from_sales=total_received_from_sales,
         estimated_cash=estimated_cash,
+        estimated_cash_before_adjustment=estimated_cash_before_adjustment,
+        cash_adjustment_usd=cash_adjustment_usd,
         estimated_net_worth=estimated_net_worth,
         investments=investments,
         positions=sorted(positions, key=lambda p: (p.quantity == 0, -p.current_value)),
