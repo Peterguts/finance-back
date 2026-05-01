@@ -62,6 +62,17 @@ def normalize_ticker(ticker: str) -> str:
     return t
 
 
+# Por decimales en compras/ventas la neta puede quedar en ~1e-7; no es una posición real.
+_POSITION_NET_EPS = 1e-4
+
+
+def _normalize_net_quantity(net: float) -> float:
+    net = max(0.0, float(net))
+    if net < _POSITION_NET_EPS:
+        return 0.0
+    return net
+
+
 def ticker_raw_variants(ticker: str) -> list[str]:
     """Valores que pueden existir en Mongo para el mismo activo (filtros)."""
     t = normalize_ticker(ticker)
@@ -392,7 +403,7 @@ async def _get_available_quantity(ticker: str) -> float:
     if t not in pos:
         return 0
     bought, sold, _ = pos[t]
-    return max(0, bought - sold)
+    return _normalize_net_quantity(max(0, bought - sold))
 
 
 async def _max_sale_quantity_allowed(ticker: str, current_sale_qty: float) -> float:
@@ -424,7 +435,7 @@ async def _get_simulator_assets_data() -> dict[str, tuple[float, float, float, f
     pos_data = await _get_position_and_cost_per_ticker()
     out: dict[str, tuple[float, float, float, float, float]] = {}
     for ticker, (bought, sold, avg_buy) in pos_data.items():
-        current_qty = max(0, bought - sold)
+        current_qty = _normalize_net_quantity(max(0, bought - sold))
         if current_qty <= 0:
             continue
         cost_basis = round(current_qty * avg_buy, 6)
@@ -762,7 +773,7 @@ async def get_portfolio_summary():
     current_value = 0.0
     positions: list[PortfolioPosition] = []
     for ticker, (bought, sold, avg_buy) in pos_data.items():
-        current_qty = max(0, bought - sold)
+        current_qty = _normalize_net_quantity(max(0, bought - sold))
         if current_qty <= 0:
             # Siempre incluir el ticker si hubo compras: evita "fantasmas" en la UI cuando
             # la posición neta es 0 pero hay compras registradas o ventas sin P/L calculado.
