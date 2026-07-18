@@ -26,9 +26,18 @@ from pydantic import BaseModel, Field
 
 app = FastAPI(title="Portfolio API")
 
+# Orígenes adicionales permitidos (ej. dominio propio en Vercel), configurables
+# sin tocar código: CORS_EXTRA_ORIGINS="https://mi-dominio.com,https://otro.com"
+_cors_extra_origins = [
+    o.strip() for o in os.environ.get("CORS_EXTRA_ORIGINS", "").split(",") if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", *_cors_extra_origins],
+    # Cubre el dominio de producción y todos los previews de Vercel para este
+    # proyecto (la URL de preview trae un hash distinto en cada deploy).
+    allow_origin_regex=r"https://finance-front.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
