@@ -1,5 +1,11 @@
 import asyncio
+import base64
+import hashlib
+import hmac
+import json
 import os
+import secrets
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,8 +18,9 @@ import yfinance as yf
 
 # Load .env from the same folder as this file (back/) so MONGO_URI is available
 load_dotenv(Path(__file__).resolve().parent / ".env")
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 
@@ -21,7 +28,7 @@ app = FastAPI(title="Portfolio API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,12 +37,18 @@ app.add_middleware(
 MONGO_URI = os.environ.get("MONGO_URI")
 FINNHUB_API_KEY = os.environ.get("FINNHUB_API_KEY")
 USD_TO_GTQ_FALLBACK = float(os.environ.get("USD_TO_GTQ_FALLBACK", "7.75"))
+JWT_SECRET = os.environ.get("JWT_SECRET", "")
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+TOKEN_TTL_SECONDS = 7 * 24 * 3600
+
 client: Optional[AsyncIOMotorClient] = None
 db = None
 coll = None  # finanzas.transactions
 sales_coll = None  # finanzas.sales
 deposits_coll = None  # finanzas.deposits
 settings_coll = None  # finanzas.settings (ajustes de efectivo, etc.)
+users_coll = None  # finanzas.users
 
 MOCK_PRICES: dict[str, float] = {
     "BTC": 67500.00,
@@ -79,6 +92,80 @@ def ticker_raw_variants(ticker: str) -> list[str]:
     if t == "LINK-USD":
         return ["LINK-USD", "LINKUSD", "LINK"]
     return [t]
+
+
+# ---------------------------------------------------------------------------
+# Auth: PBKDF2 password hashing + HS256 JWT, solo stdlib
+# ---------------------------------------------------------------------------
+
+PBKDF2_ITERATIONS = 200_000
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256", password.encode(), bytes.fromhex(salt), PBKDF2_ITERATIONS
+    )
+    return f"pbkdf2_sha256${PBKDF2_ITERATIONS}${salt}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        _, iterations, salt, expected = stored.split("$")
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), bytes.fromhex(salt), int(iterations)
+        )
+        return hmac.compare_digest(digest.hex(), expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _b64url_decode(data: str) -> bytes:
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def create_token(email: str) -> str:
+    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    payload = _b64url(
+        json.dumps({"sub": email, "exp": int(time.time()) + TOKEN_TTL_SECONDS}).encode()
+    )
+    signing_input = f"{header}.{payload}".encode()
+    signature = _b64url(hmac.new(JWT_SECRET.encode(), signing_input, hashlib.sha256).digest())
+    return f"{header}.{payload}.{signature}"
+
+
+def decode_token(token: str) -> Optional[str]:
+    """Devuelve el email del usuario si el token es válido y no expiró."""
+    try:
+        header, payload, signature = token.split(".")
+        signing_input = f"{header}.{payload}".encode()
+        expected = _b64url(hmac.new(JWT_SECRET.encode(), signing_input, hashlib.sha256).digest())
+        if not hmac.compare_digest(signature, expected):
+            return None
+        claims = json.loads(_b64url_decode(payload))
+        if claims.get("exp", 0) < time.time():
+            return None
+        return claims.get("sub")
+    except (ValueError, TypeError):
+        return None
+
+
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+async def require_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
+) -> str:
+    if credentials is None:
+        raise HTTPException(status_code=401, detail="No autenticado")
+    email = decode_token(credentials.credentials)
+    if email is None:
+        raise HTTPException(status_code=401, detail="Sesión inválida o expirada")
+    return email
 
 
 def _yfinance_price_sync(symbol: str) -> float:
@@ -146,7 +233,7 @@ async def get_current_price(ticker: str) -> float:
 
 @app.on_event("startup")
 async def startup_db_client():
-    global client, db, coll, sales_coll, deposits_coll, settings_coll
+    global client, db, coll, sales_coll, deposits_coll, settings_coll, users_coll
     if MONGO_URI:
         client = AsyncIOMotorClient(MONGO_URI)
         db = client.finanzas
@@ -154,12 +241,25 @@ async def startup_db_client():
         sales_coll = db.sales
         deposits_coll = db.deposits
         settings_coll = db.settings
+        users_coll = db.users
         await coll.create_index("ticker")
         await sales_coll.create_index("ticker")
         await sales_coll.create_index("date")
         await sales_coll.create_index("created_at")
         await deposits_coll.create_index("date")
         await deposits_coll.create_index("created_at")
+        # Usuario inicial: solo si la colección está vacía y hay credenciales en .env
+        if ADMIN_EMAIL and ADMIN_PASSWORD:
+            existing = await users_coll.count_documents({})
+            if existing == 0:
+                await users_coll.insert_one(
+                    {
+                        "_id": str(uuid.uuid4()),
+                        "email": ADMIN_EMAIL.lower(),
+                        "password_hash": hash_password(ADMIN_PASSWORD),
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
 
 
 @app.on_event("shutdown")
@@ -167,6 +267,11 @@ async def shutdown_db_client():
     global client
     if client:
         client.close()
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(..., min_length=3)
+    password: str = Field(..., min_length=1)
 
 
 class InvestmentCreate(BaseModel):
@@ -187,6 +292,7 @@ class Investment(BaseModel):
     amount: float
     buy_price: float
     timestamp: str  # ISO date/datetime from created_at or date
+    remaining_quantity: float = 0.0  # FIFO: cuánto de este lote sigue sin vender
 
 
 class SaleCreate(BaseModel):
@@ -308,17 +414,19 @@ class SimulatorScenarioResult(BaseModel):
     roi_pct: float
 
 
-def _doc_to_investment(doc: dict) -> Investment:
+def _doc_to_investment(doc: dict, remaining_quantity: Optional[float] = None) -> Investment:
     """Map finanzas.transactions document to API Investment model."""
     doc_id = doc.get("id") or doc.get("_id")
     if doc_id is None:
         doc_id = ""
+    qty = float(doc.get("quantity", 0))
     return Investment(
         id=str(doc_id),
         ticker=normalize_ticker(doc.get("ticker", "")),
-        amount=float(doc.get("quantity", 0)),
+        amount=qty,
         buy_price=float(doc.get("buy_price", 0)),
         timestamp=doc.get("created_at") or doc.get("date") or "",
+        remaining_quantity=qty if remaining_quantity is None else remaining_quantity,
     )
 
 
@@ -356,45 +464,105 @@ def _parse_doc_datetime(doc: dict) -> Optional[datetime]:
 
 
 async def _get_position_and_cost_per_ticker() -> dict[str, tuple[float, float, float]]:
-    """Returns per ticker: (total_bought_qty, total_sold_qty, avg_buy_price)."""
-    ticker_bought: dict[str, list[tuple[float, float]]] = {}  # ticker -> [(qty, price), ...]
-    ticker_first_buy_dt: dict[str, datetime] = {}
+    """Returns per ticker: (total_bought_qty, total_sold_qty, avg_buy_price).
+
+    avg_buy_price usa costo promedio MÓVIL: se procesan compras y ventas en
+    orden cronológico y cada venta retira unidades al costo promedio vigente
+    en ese momento. Así, si un ticker tuvo un ciclo de compra-venta ya
+    cerrado en el pasado, ese costo no se mezcla con las compras nuevas que
+    abrieron la posición actual (evita inflar/deflactar el costo de lo que
+    tienes hoy con precios de lotes que ya no existen).
+    """
+    events: dict[str, list[tuple[datetime, str, float, float]]] = {}
     async for doc in coll.find():
         t = normalize_ticker(doc.get("ticker") or "")
         if not t:
             continue
         q = float(doc.get("quantity", 0))
         p = float(doc.get("buy_price", 0))
-        if t not in ticker_bought:
-            ticker_bought[t] = []
-        ticker_bought[t].append((q, p))
-        dt = _parse_doc_datetime(doc)
-        if dt is not None:
-            prev = ticker_first_buy_dt.get(t)
-            if prev is None or dt < prev:
-                ticker_first_buy_dt[t] = dt
-    ticker_sold: dict[str, float] = {}
+        dt = _parse_doc_datetime(doc) or datetime.min.replace(tzinfo=timezone.utc)
+        events.setdefault(t, []).append((dt, "buy", q, p))
     if sales_coll is not None:
         async for doc in sales_coll.find():
             t = normalize_ticker(doc.get("ticker") or "")
             if not t:
                 continue
-            first_buy = ticker_first_buy_dt.get(t)
-            if first_buy is not None:
-                sale_dt = _parse_doc_datetime(doc)
-                # Preserve historical sales records without descontar posiciones
-                # when they happened before the current portfolio baseline.
-                if sale_dt is not None and sale_dt < first_buy:
-                    continue
-            ticker_sold[t] = ticker_sold.get(t, 0) + float(doc.get("quantity", 0))
+            q = float(doc.get("quantity", 0))
+            p = float(doc.get("sell_price", 0))
+            dt = _parse_doc_datetime(doc) or datetime.min.replace(tzinfo=timezone.utc)
+            events.setdefault(t, []).append((dt, "sell", q, p))
+
     result: dict[str, tuple[float, float, float]] = {}
-    for t, buys in ticker_bought.items():
-        total_bought = sum(q for q, _ in buys)
-        total_cost = sum(q * p for q, p in buys)
-        total_sold = ticker_sold.get(t, 0)
-        avg_price = total_cost / total_bought if total_bought > 0 else 0
+    for t, evs in events.items():
+        evs.sort(key=lambda e: e[0])
+        qty = 0.0
+        cost = 0.0
+        total_bought = 0.0
+        total_sold = 0.0
+        for _dt, kind, q, p in evs:
+            if kind == "buy":
+                qty += q
+                cost += q * p
+                total_bought += q
+            else:
+                total_sold += q
+                take = min(q, qty) if qty > 1e-12 else 0.0
+                if take > 0:
+                    cost -= take * (cost / qty)
+                    qty -= take
+                if qty < 0:
+                    qty = 0.0
+                if cost < 0:
+                    cost = 0.0
+        avg_price = (cost / qty) if qty > 1e-9 else 0.0
         result[t] = (total_bought, total_sold, avg_price)
     return result
+
+
+async def _get_remaining_quantity_by_doc_id() -> dict[str, float]:
+    """FIFO: cuánto de cada documento de compra individual sigue sin vender.
+
+    Solo se usa para saber qué documentos de compra siguen "vivos" en un ticker
+    (permite habilitar Editar/Eliminar por lote en el frontend incluso si existen
+    lotes históricos ya cerrados del mismo ticker). No afecta el costo promedio
+    móvil que usa `_get_position_and_cost_per_ticker` para P/L.
+    """
+    events: dict[str, list[tuple[datetime, str, str, float]]] = {}
+    async for doc in coll.find():
+        t = normalize_ticker(doc.get("ticker") or "")
+        if not t:
+            continue
+        doc_id = str(doc.get("id") or doc.get("_id"))
+        q = float(doc.get("quantity", 0))
+        dt = _parse_doc_datetime(doc) or datetime.min.replace(tzinfo=timezone.utc)
+        events.setdefault(t, []).append((dt, "buy", doc_id, q))
+    if sales_coll is not None:
+        async for doc in sales_coll.find():
+            t = normalize_ticker(doc.get("ticker") or "")
+            if not t:
+                continue
+            q = float(doc.get("quantity", 0))
+            dt = _parse_doc_datetime(doc) or datetime.min.replace(tzinfo=timezone.utc)
+            events.setdefault(t, []).append((dt, "sell", "", q))
+
+    remaining: dict[str, float] = {}
+    for t, evs in events.items():
+        evs.sort(key=lambda e: e[0])
+        lots: list[list] = []  # [doc_id, remaining_qty]
+        for _dt, kind, doc_id, q in evs:
+            if kind == "buy":
+                lots.append([doc_id, q])
+            else:
+                to_sell = q
+                for lot in lots:
+                    if to_sell <= 1e-12:
+                        break
+                    take = min(lot[1], to_sell)
+                    lot[1] -= take
+                    to_sell -= take
+        for doc_id, rem in lots:
+            remaining[doc_id] = max(0.0, rem)
+    return remaining
 
 
 async def _get_available_quantity(ticker: str) -> float:
@@ -452,8 +620,27 @@ async def health_check():
     return {"status": "healthy", "database": "connected" if db is not None else "not connected"}
 
 
+@app.post("/auth/login")
+async def login(request: LoginRequest):
+    if users_coll is None:
+        raise HTTPException(status_code=503, detail="Database not connected")
+    user = await users_coll.find_one({"email": request.email.strip().lower()})
+    if user is None or not verify_password(request.password, user.get("password_hash", "")):
+        raise HTTPException(status_code=401, detail="Correo o contraseña incorrectos")
+    return {
+        "access_token": create_token(user["email"]),
+        "token_type": "bearer",
+        "email": user["email"],
+    }
+
+
+@app.get("/auth/me")
+async def me(email: str = Depends(require_user)):
+    return {"email": email}
+
+
 @app.post("/investments", response_model=Investment)
-async def create_investment(investment: InvestmentCreate):
+async def create_investment(investment: InvestmentCreate, _: str = Depends(require_user)):
     if coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     now = datetime.now(timezone.utc)
@@ -477,21 +664,23 @@ async def create_investment(investment: InvestmentCreate):
 
 
 @app.get("/investments", response_model=list[Investment])
-async def get_investments(ticker: Optional[str] = Query(None)):
+async def get_investments(ticker: Optional[str] = Query(None), _: str = Depends(require_user)):
     if coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     q = {}
     if ticker and ticker.strip():
         q["ticker"] = {"$in": ticker_raw_variants(ticker.strip())}
+    remaining_map = await _get_remaining_quantity_by_doc_id()
     investments = []
     cursor = coll.find(q).sort("created_at", -1)
     async for doc in cursor:
-        investments.append(_doc_to_investment(doc))
+        doc_id = str(doc.get("id") or doc.get("_id"))
+        investments.append(_doc_to_investment(doc, remaining_map.get(doc_id)))
     return investments
 
 
 @app.get("/investments/{investment_id}", response_model=Investment)
-async def get_investment(investment_id: str):
+async def get_investment(investment_id: str, _: str = Depends(require_user)):
     if coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     doc = await coll.find_one({"$or": [{"_id": investment_id}, {"id": investment_id}]})
@@ -501,7 +690,9 @@ async def get_investment(investment_id: str):
 
 
 @app.put("/investments/{investment_id}", response_model=Investment)
-async def update_investment(investment_id: str, update: InvestmentUpdate):
+async def update_investment(
+    investment_id: str, update: InvestmentUpdate, _: str = Depends(require_user)
+):
     if coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     raw = update.model_dump(exclude_none=True)
@@ -526,7 +717,7 @@ async def update_investment(investment_id: str, update: InvestmentUpdate):
 
 
 @app.delete("/investments/{investment_id}")
-async def delete_investment(investment_id: str):
+async def delete_investment(investment_id: str, _: str = Depends(require_user)):
     if coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     result = await coll.delete_one(
@@ -541,7 +732,7 @@ async def delete_investment(investment_id: str):
 
 
 @app.post("/sales", response_model=Sale)
-async def create_sale(sale: SaleCreate):
+async def create_sale(sale: SaleCreate, _: str = Depends(require_user)):
     if coll is None or sales_coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     ticker = normalize_ticker(sale.ticker)
@@ -582,6 +773,7 @@ async def get_sales(
     from_date: Optional[str] = Query(None, alias="from_date"),
     to_date: Optional[str] = Query(None, alias="to_date"),
     limit: int = Query(100, ge=1, le=500),
+    _: str = Depends(require_user),
 ):
     if sales_coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
@@ -602,7 +794,7 @@ async def get_sales(
 
 
 @app.get("/sales/{sale_id}", response_model=Sale)
-async def get_sale(sale_id: str):
+async def get_sale(sale_id: str, _: str = Depends(require_user)):
     if sales_coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     doc = await sales_coll.find_one({"$or": [{"_id": sale_id}, {"id": sale_id}]})
@@ -612,7 +804,7 @@ async def get_sale(sale_id: str):
 
 
 @app.patch("/sales/{sale_id}", response_model=Sale)
-async def update_sale(sale_id: str, update: SaleUpdate):
+async def update_sale(sale_id: str, update: SaleUpdate, _: str = Depends(require_user)):
     if sales_coll is None or coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     raw = update.model_dump(exclude_none=True)
@@ -653,7 +845,7 @@ async def update_sale(sale_id: str, update: SaleUpdate):
 
 
 @app.delete("/sales/{sale_id}")
-async def delete_sale(sale_id: str):
+async def delete_sale(sale_id: str, _: str = Depends(require_user)):
     if sales_coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     result = await sales_coll.delete_one({"$or": [{"_id": sale_id}, {"id": sale_id}]})
@@ -669,6 +861,7 @@ async def get_movements(
     to_date: Optional[str] = Query(None, alias="to_date"),
     type_filter: Optional[str] = Query(None, alias="type"),  # "buy" | "sell" | omit = all
     limit: int = Query(200, ge=1, le=1000),
+    _: str = Depends(require_user),
 ):
     """List all movements (buys + sales) with optional filters, sorted by date descending."""
     if coll is None or sales_coll is None:
@@ -735,12 +928,14 @@ async def get_movements(
 
 
 @app.get("/portfolio/summary", response_model=PortfolioSummary)
-async def get_portfolio_summary():
+async def get_portfolio_summary(_: str = Depends(require_user)):
     if coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     investments = []
+    remaining_map = await _get_remaining_quantity_by_doc_id()
     async for doc in coll.find().sort("created_at", -1):
-        investments.append(_doc_to_investment(doc))
+        doc_id = str(doc.get("id") or doc.get("_id"))
+        investments.append(_doc_to_investment(doc, remaining_map.get(doc_id)))
 
     ticker_first_buy_dt: dict[str, datetime] = {}
     async for doc in coll.find():
@@ -880,7 +1075,7 @@ async def get_prices_status():
 
 
 @app.get("/prices")
-async def get_all_prices():
+async def get_all_prices(_: str = Depends(require_user)):
     if coll is None:
         return MOCK_PRICES
     tickers: set[str] = set()
@@ -897,7 +1092,7 @@ async def get_all_prices():
 
 
 @app.get("/prices/{ticker}")
-async def get_price(ticker: str):
+async def get_price(ticker: str, _: str = Depends(require_user)):
     sym = normalize_ticker(ticker)
     price = await get_current_price(sym)
     if price == 0:
@@ -918,7 +1113,7 @@ async def get_usd_gtq_rate():
 
 
 @app.get("/simulator/assets", response_model=list[SimulatorAsset])
-async def list_simulator_assets():
+async def list_simulator_assets(_: str = Depends(require_user)):
     if coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     assets = await _get_simulator_assets_data()
@@ -944,6 +1139,7 @@ async def get_simulator_history(
     period: str = Query("3mo"),
     interval: str = Query("1d"),
     limit: int = Query(120, ge=10, le=500),
+    _: str = Depends(require_user),
 ):
     symbol = normalize_ticker(ticker)
     symbol = TICKER_ALIASES.get(symbol, symbol)
@@ -975,7 +1171,7 @@ async def get_simulator_history(
 
 
 @app.post("/simulator/scenario", response_model=SimulatorScenarioResult)
-async def simulate_scenario(body: SimulatorScenarioRequest):
+async def simulate_scenario(body: SimulatorScenarioRequest, _: str = Depends(require_user)):
     if coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     t = normalize_ticker(body.ticker)
@@ -1022,7 +1218,7 @@ def _doc_to_deposit(doc: dict) -> Deposit:
 
 
 @app.post("/deposits", response_model=Deposit)
-async def create_deposit(body: DepositCreate):
+async def create_deposit(body: DepositCreate, _: str = Depends(require_user)):
     if deposits_coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     commission_amount, total = _deposit_amounts(body.amount, body.commission_pct)
@@ -1045,7 +1241,7 @@ async def create_deposit(body: DepositCreate):
 
 
 @app.get("/deposits", response_model=list[Deposit])
-async def list_deposits():
+async def list_deposits(_: str = Depends(require_user)):
     if deposits_coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     out: list[Deposit] = []
@@ -1055,7 +1251,7 @@ async def list_deposits():
 
 
 @app.get("/deposits/{deposit_id}", response_model=Deposit)
-async def get_deposit(deposit_id: str):
+async def get_deposit(deposit_id: str, _: str = Depends(require_user)):
     if deposits_coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     doc = await deposits_coll.find_one({"$or": [{"_id": deposit_id}, {"id": deposit_id}]})
@@ -1065,7 +1261,7 @@ async def get_deposit(deposit_id: str):
 
 
 @app.put("/deposits/{deposit_id}", response_model=Deposit)
-async def update_deposit(deposit_id: str, update: DepositUpdate):
+async def update_deposit(deposit_id: str, update: DepositUpdate, _: str = Depends(require_user)):
     if deposits_coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     doc = await deposits_coll.find_one({"$or": [{"_id": deposit_id}, {"id": deposit_id}]})
@@ -1099,7 +1295,7 @@ async def update_deposit(deposit_id: str, update: DepositUpdate):
 
 
 @app.delete("/deposits/{deposit_id}")
-async def delete_deposit(deposit_id: str):
+async def delete_deposit(deposit_id: str, _: str = Depends(require_user)):
     if deposits_coll is None:
         raise HTTPException(status_code=503, detail="Database not connected")
     result = await deposits_coll.delete_one(
